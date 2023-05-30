@@ -2,7 +2,7 @@
 """
 Common modules
 """
-
+import torch.nn.functional as F
 import ast
 import contextlib
 import json
@@ -744,7 +744,7 @@ class AutoShape(nn.Module):
                     # Process predictions
                     for i, det in enumerate(y):  # per image
                         if len(det):
-                            masks = process_mask(proto[i], det[:, 6:], det[:, :4], shape0[i], upsample=True)  # HWC
+                            masks = process_mask(proto[i], det[:, 6:], det[:, :4], shape1, upsample=True)  # HWC
                             masks_list.append(masks)
                             y[i][:, :4] = scale_boxes(shape1, y[i][:, :4], shape0[i]).round()  # rescale boxes to im0 size
             return Detections(ims, y, files, dt, self.names, x.shape, masks_list=masks_list)
@@ -791,9 +791,15 @@ class Detections:
                         im_gpu = torch.from_numpy(chw_im).to(select_device(None))
                         im_gpu = im_gpu.half()  # uint8 to fp16/32
                         im_gpu /= 255  # 0 - 255 to 0.0 - 1.0
+
+                        h, w, c = im.shape
+                        #
+                        masks_resized = F.interpolate(self.masks_list[i].unsqueeze(1), size=(h, w), mode='bilinear', align_corners=False)
+                        masks_resized = masks_resized.squeeze(1)
                         # Mask plotting
                         annotator.masks(
-                            self.masks_list[i],
+                            # self.masks_list[i],
+                            masks_resized,
                             colors=[colors(x, True) for x in cls_list],
                             im_gpu=im_gpu
                         )
