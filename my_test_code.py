@@ -3,7 +3,6 @@ import yolov5
 import numpy
 from yolov5.models.yolo import SegmentationModel
 
-
 # model = yolov5.load('yolov5s.pt')
 model = yolov5.load('yolov5s-seg.pt')
 # model = SegmentationModel(yolov5.load('yolov5s-seg.pt'), cfg="yolov5s-seg.yaml")
@@ -17,8 +16,10 @@ model.max_det = 1000  # maximum number of detections per image
 
 # perform inference
 im = cv2.imread("bus.jpg")
-im_rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-results = model(im_rgb)
+results = model(im)
+
+# im_rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+# results = model(im_rgb)
 
 # parse results
 predictions = results.pred[0]
@@ -27,4 +28,3 @@ scores = predictions[:, 4]
 categories = predictions[:, 5]
 print(scores)
 results.save(save_dir='results/')
-
