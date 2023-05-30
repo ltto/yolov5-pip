@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from yolov5.utils import TryExcept, threaded
 from yolov5.utils.general import (CONFIG_DIR, FONT, LOGGER, check_font, check_requirements, clip_boxes, increment_path,
-                           is_ascii, xywh2xyxy, xyxy2xywh)
+                                  is_ascii, xywh2xyxy, xyxy2xywh)
 from yolov5.utils.metrics import fitness
 from yolov5.utils.segment.general import scale_image
 

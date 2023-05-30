@@ -24,12 +24,14 @@ import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
 
+from yolov5.utils.torch_utils import select_device
 from yolov5.utils import TryExcept
 from yolov5.utils.dataloaders import exif_transpose, letterbox
 from yolov5.utils.downloads import attempt_download_from_hub
 from yolov5.utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suffix, check_version, colorstr,
-                           increment_path, is_jupyter, make_divisible, non_max_suppression, scale_boxes, xywh2xyxy,
-                           xyxy2xywh, yaml_load)
+                                  increment_path, is_jupyter, make_divisible, non_max_suppression, scale_boxes, xywh2xyxy,
+                                  xyxy2xywh, yaml_load)
+from yolov5.utils.segment.general import (process_mask)
 from yolov5.utils.plots import Annotator, colors, save_one_box
 from yolov5.utils.torch_utils import copy_attr, smart_inference_mode
 
@@ -705,45 +707,68 @@ class AutoShape(nn.Module):
             x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
-
+        masks_list = None
         with amp.autocast(autocast):
-            # Inference
-            with dt[1]:
-                y = self.model(x, augment=augment)  # forward
+            if self.model.model.__class__.__name__ != "SegmentationModel":
+                # Inference
+                with dt[1]:
+                    y = self.model(x, augment=augment)  # forward
 
-            # Post-process
-            with dt[2]:
-                y = non_max_suppression(y if self.dmb else y[0],
-                                        self.conf,
-                                        self.iou,
-                                        self.classes,
-                                        self.agnostic,
-                                        self.multi_label,
-                                        max_det=self.max_det)  # NMS
-                for i in range(n):
-                    scale_boxes(shape1, y[i][:, :4], shape0[i])
+                # Post-process
+                with dt[2]:
+                    y = non_max_suppression(y if self.dmb else y[0],
+                                            self.conf,
+                                            self.iou,
+                                            self.classes,
+                                            self.agnostic,
+                                            self.multi_label,
+                                            max_det=self.max_det)  # NMS
+                    for i in range(n):
+                        scale_boxes(shape1, y[i][:, :4], shape0[i])
+            else:
+                # Inference
+                with dt[1]:
+                    y, proto = self.model(x, augment=augment, visualize=False)[:2]
 
-            return Detections(ims, y, files, dt, self.names, x.shape)
+                # NMS
+                with dt[2]:
+                    y = non_max_suppression(y if self.dmb else y[0],
+                                            self.conf,
+                                            self.iou,
+                                            self.classes,
+                                            self.agnostic,
+                                            self.multi_label,
+                                            max_det=self.max_det,
+                                            nm=32)
+                    masks_list = []
+                    # Process predictions
+                    for i, det in enumerate(y):  # per image
+                        if len(det):
+                            masks = process_mask(proto[i], det[:, 6:], det[:, :4], shape0[i], upsample=True)  # HWC
+                            masks_list.append(masks)
+                            y[i][:, :4] = scale_boxes(shape1, y[i][:, :4], shape0[i]).round()  # rescale boxes to im0 size
+            return Detections(ims, y, files, dt, self.names, x.shape, masks_list=masks_list)
 
 
 class Detections:
     # YOLOv5 detections class for inference results
-    def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):
+    def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None, masks_list=None):
         super().__init__()
         d = pred[0].device  # device
-        gn = [torch.tensor([*(im.shape[i] for i in [1, 0, 1, 0]), 1, 1], device=d) for im in ims]  # normalizations
+        # gn = [torch.tensor([*(im.shape[i] for i in [1, 0, 1, 0]), 1, 1], device=d) for im in ims]  # normalizations
         self.ims = ims  # list of images as numpy arrays
         self.pred = pred  # list of tensors pred[0] = (xyxy, conf, cls)
         self.names = names  # class names
         self.files = files  # image filenames
         self.times = times  # profiling times
         self.xyxy = pred  # xyxy pixels
-        self.xywh = [xyxy2xywh(x) for x in pred]  # xywh pixels
-        self.xyxyn = [x / g for x, g in zip(self.xyxy, gn)]  # xyxy normalized
-        self.xywhn = [x / g for x, g in zip(self.xywh, gn)]  # xywh normalized
+        # self.xywh = [xyxy2xywh(x) for x in pred]  # xywh pixels
+        # self.xyxyn = [x / g for x, g in zip(self.xyxy, gn)]  # xyxy normalized
+        # self.xywhn = [x / g for x, g in zip(self.xywh, gn)]  # xywh normalized
         self.n = len(self.pred)  # number of images (batch size)
         self.t = tuple(x.t / self.n * 1E3 for x in times)  # timestamps (ms)
         self.s = tuple(shape)  # inference BCHW shape
+        self.masks_list = masks_list
 
     def _run(self, pprint=False, show=False, save=False, crop=False, render=False, labels=True, save_dir=Path('')):
         s, crops = '', []
@@ -756,7 +781,26 @@ class Detections:
                 s = s.rstrip(', ')
                 if show or save or render or crop:
                     annotator = Annotator(im, example=str(self.names))
-                    for *box, conf, cls in reversed(pred):  # xyxy, confidence, class
+                    box_list = pred[:, :4]
+                    conf_list = pred[:, 4]
+                    cls_list = pred[:, 5]
+
+                    if self.masks_list is not None:
+                        # Convert HWC to CHW
+                        chw_im = np.transpose(im, (2, 0, 1))
+                        im_gpu = torch.from_numpy(chw_im).to(select_device(None))
+                        im_gpu = im_gpu.half()  # uint8 to fp16/32
+                        im_gpu /= 255  # 0 - 255 to 0.0 - 1.0
+                        # Mask plotting
+                        annotator.masks(
+                            self.masks_list[i],
+                            colors=[colors(x, True) for x in cls_list],
+                            im_gpu=im_gpu
+                        )
+                    for idx in range(pred.shape[0]):
+                        box = box_list[idx]
+                        conf = conf_list[idx]
+                        cls = cls_list[idx]
                         label = f'{self.names[int(cls)]} {conf:.2f}'
                         if crop:
                             file = save_dir / 'crops' / self.names[int(cls)] / self.files[i] if save else None
